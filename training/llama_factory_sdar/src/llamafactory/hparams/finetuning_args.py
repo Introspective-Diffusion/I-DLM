@@ -541,6 +541,24 @@ class FinetuningArguments(
             )
         },
     )
+    use_relay: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Speculative Relay: feed the invalidated draft suffix into the next "
+                "proposal canvas instead of fresh [MASK]s."
+            )
+        },
+    )
+    stop_grad_relay: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Detach the relayed state between the two passes so no gradient crosses "
+                "them (Relay's stop_grad_h_s / the Relay (sg) ablation)."
+            )
+        },
+    )
 
     def __post_init__(self):
         def split_arg(arg):

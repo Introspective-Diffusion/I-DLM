@@ -19,7 +19,7 @@ import json
 import os
 from types import MethodType
 from typing import TYPE_CHECKING, Any, Optional, Union
-
+import sys
 import torch.nn.functional as F
 import numpy as np
 import torch
@@ -115,16 +115,92 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         labels = inputs.get("labels")
         assert labels is not None
 
+        # The collator doesn't emit position_ids for non-packed data. Generate them
+        # here so both the model's internal use and our relay canvas see the same thing.
+        if inputs.get("position_ids") is None:
+            _b, _l = inputs["input_ids"].shape
+            inputs["position_ids"] = (
+                torch.arange(_l, device=inputs["input_ids"].device)
+                .unsqueeze(0).expand(_b, -1).contiguous()
+            )
+
         # Forward pass — the SDAR model internally concatenates [noisy_xt | clean_x0],
         # so input_ids has length L but hidden_states has length 2L.
-        outputs = model(**inputs, output_hidden_states=True)
-        task_loss = outputs["loss"]  # CE on all positions (noisy + clean)
+        
 
-        # Unwrap DeepSpeedEngine/FSDP to access lm_head directly
         unwrapped_model = getattr(model, "module", model)
-
-        # seq_len = L (original input length); clean region is hidden_states[:, L:2L]
         seq_len = inputs["input_ids"].size(-1)
+        use_relay = getattr(self.finetuning_args, "use_relay", False)
+
+        prev_latent = None
+        bd = None
+        n_pred = None
+
+        if use_relay:
+            # PEFT wraps the model, so type(unwrapped_model).__module__ is peft.peft_model.
+            # Find the already-imported modeling_sdar module directly instead.
+            sdar = next(m for n, m in sys.modules.items() if n.endswith(".modeling_sdar"))
+
+            # ---- pass 1: all-mask, no grad. We only want the hidden states. ----
+            with torch.no_grad():
+                out1 = model(**inputs, output_hidden_states=True)
+            h = out1["hidden_states"][-1][:, :seq_len, :]
+            h = torch.cat([h[:, :1, :], h[:, :-1, :]], dim=1)   # hidden[i] predicts i+1
+            if getattr(self.finetuning_args, "stop_grad_relay", True):
+                h = h.detach()
+            prev_latent = torch.cat([h, torch.zeros_like(h)], dim=1)  # zeros on clean half
+
+            # ---- build the pass-2 canvas ----
+            pos = sdar.modify_padded_position_ids_2d(inputs["position_ids"].clone())
+            bd = list(unwrapped_model.prepare_for_bd_training(
+                inputs["input_ids"], pos, (labels == -100)))
+            concat_ids, concat_pos, attn, keep_half, keep, p_mask = bd
+
+            bsz = inputs["input_ids"].size(0)
+            blk = unwrapped_model.config.block_size
+            dev = concat_ids.device
+
+            # random rejection boundary per block. "<=" reveals the correction too.
+            nblk   = seq_len // blk
+            r = torch.randint(0, blk - 1, (bsz, nblk), device=dev)
+            off    = torch.arange(blk, device=dev).view(1, 1, -1)
+            reveal = (off <= r.unsqueeze(-1)).reshape(bsz, nblk * blk)
+            if reveal.size(1) < seq_len:
+                reveal = F.pad(reveal, (0, seq_len - reveal.size(1)), value=False)
+            reveal = reveal & keep_half        # only touch positions that are masked
+
+            # noisy and clean halves are interleaved per packed sub-sequence
+            num_tokens = sdar.calculate_token_nums(pos)
+            if self.state.global_step == 0:
+                logger.info_rank0(f"[relay] num_tokens[0] = {num_tokens[0].tolist()}")
+
+            router = torch.stack([
+                (torch.arange(num_tokens[i].shape[0] * 2, device=dev) % 2 == 0)
+                .repeat_interleave(num_tokens[i].repeat_interleave(2))
+                for i in range(bsz)
+            ], dim=0)
+
+            for i in range(bsz):
+                half = concat_ids[i][router[i]]
+                concat_ids[i][router[i]] = torch.where(
+                    reveal[i], inputs["input_ids"][i], half)      # ground truth up to r
+                keep_half[i] = keep_half[i] & ~reveal[i]          # drop them from the loss
+                keep[i][router[i]] = keep_half[i]
+
+            n_pred = int(keep_half.sum())
+            p_mask = torch.ones(n_pred, device=dev, dtype=p_mask.dtype)
+            bd = (concat_ids, concat_pos, attn, keep_half, keep, p_mask)
+
+        # --- pass 2 (or the only pass, when relay is off) ---
+        outputs = model(**inputs, output_hidden_states=True,
+                        prev_latent=prev_latent, bd_inputs=bd)
+        task_loss = outputs["loss"]
+
+        # The model divides by all answer tokens, but we now predict fewer.
+        # Without this, the relay arm's loss looks lower for a purely mechanical reason.
+        if use_relay and n_pred:
+            task_loss = task_loss * int((labels != -100).sum()) / n_pred
+
 
         # AR CE loss on clean (x0) region with Dream-shift-aligned labels.
         # hidden[i] predicts token[i+1], so shift labels by 1.
@@ -132,8 +208,9 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         if shifted_labels.shape[1] < seq_len:
             shifted_labels = F.pad(shifted_labels, (0, seq_len - shifted_labels.shape[1]), value=-100)
 
+        _clean_h = outputs["hidden_states"][-1][:, seq_len : seq_len + seq_len, :]
         clean_logits = unwrapped_model.lm_head(
-            outputs["hidden_states"][-1][:, seq_len : seq_len + seq_len, :]
+            _clean_h.to(unwrapped_model.lm_head.weight.dtype)
         )
         ce_logits = clean_logits.view(-1, clean_logits.size(-1))
         ce_labels = shifted_labels.view(-1)
@@ -152,7 +229,13 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             "train/combined_loss": combined_loss.item(),
             "train/alpha": alpha,
         }
+        if use_relay:
+            ln = [p for n, p in unwrapped_model.named_parameters()
+                  if "layer_norm" in n and p.requires_grad]
+            if ln:
+                log_dict["train/ln_weight_norm"] = ln[0].norm().item()
         self.log(log_dict)
+
 
         if self.state.global_step % self.args.logging_steps == 0:
             logger.info_rank0(

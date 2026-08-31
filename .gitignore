@@ -33,3 +33,16 @@ Thumbs.db
 tmp*/
 
 .omc
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.log
+logs/
+wandb/
+checkpoints/
+checkpoint-*/
+.env
+.env.local
+__pycache__/

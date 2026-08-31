@@ -1,0 +1,59 @@
+### model
+model_name_or_path: /work/pi_mccallum_umass_edu/rjagalamari_umass_edu/idlm/all_ladder_experiments/ladder_5_hidden_relay/model/I-DLM-8B-N8-relay
+train_from_scratch: false
+trust_remote_code: true
+disable_gradient_checkpointing: false
+
+### method
+stage: sft
+do_train: true
+finetuning_type: lora
+lora_rank: 128
+lora_alpha: 256
+lora_dropout: 0.0
+lora_target: q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj
+
+### dataset
+dataset: open_thoughts3_sample
+template: qwen3
+pretokenized: false
+cutoff_len: 4095
+block_length: 7
+truncate_mode: cut
+overwrite_cache: false
+preprocessing_num_workers: 4
+dataloader_num_workers: 4
+
+### introspective training loss
+idlm_loss_type: ar
+loss_auto_balance: true
+
+### relay
+use_relay: true
+stop_grad_relay: true
+additional_target: layer_norm
+
+### output
+output_dir: ../../../lora_with_hidden_relay_finetune/checkpoints
+logging_steps: 5
+save_steps: 50
+save_total_limit: 10
+plot_loss: true
+overwrite_output_dir: true
+save_only_model: false
+report_to: wandb
+wandb_project: IDLM
+
+### train
+run_name: rung5_relay_N8
+seed: 42
+include_effective_tokens_per_second: true
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 32
+learning_rate: 2.0e-4
+num_train_epochs: 1.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.03
+bf16: true
+ddp_timeout: 180000000
+max_samples: 16000
